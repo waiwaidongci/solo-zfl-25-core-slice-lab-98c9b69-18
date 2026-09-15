@@ -4,6 +4,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node test-labels.mjs",
+    "walkthrough": "node walkthrough-labels.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "^29.1.1"
   }
 }

@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const dbPath = join(__dirname, "data", "core-slices.json");
+const dbPath = process.env.DB_PATH || join(__dirname, "data", "core-slices.json");
 const port = Number(process.env.PORT || 3025);
 const statuses = ["待切割", "制片中", "待观察", "已交付"];
 const taskSteps = ["取样", "切割", "研磨", "染色", "观察"];
@@ -118,8 +118,21 @@ function makeLabel(db, { batchId, template, step, sliceId, serial, reprintOf }) 
   return label;
 }
 function publicLabel(label) { return label; }
+// 批次对外视图(不暴露内部请求指纹)
+function publicBatch(batch) {
+  return { id: batch.id, idempotencyKey: batch.idempotencyKey, templateVersion: batch.templateVersion, step: batch.step, count: batch.count, createdAt: batch.createdAt };
+}
 function batchView(db, batch) {
-  return { ...batch, labels: db.labels.filter(label => label.batchId === batch.id) };
+  return { ...publicBatch(batch), labels: db.labels.filter(label => label.batchId === batch.id) };
+}
+// 幂等键绑定请求内容:模板版本 + 工序 + 切片集合 + 显式序号
+function requestFingerprint(input, sliceIds) {
+  return crypto.createHash("sha256").update(JSON.stringify({
+    templateVersion: Number(input.templateVersion),
+    step: String(input.step || ""),
+    sliceIds,
+    serials: Array.isArray(input.serials) ? input.serials.map(Number) : null
+  })).digest("hex");
 }
 
 const page = `<!doctype html>
@@ -385,7 +398,7 @@ const server = http.createServer(async (req, res) => {
     // ---------- 批量签发:幂等 + 整批原子 ----------
     if (req.method === "GET" && url.pathname === "/api/label-batches") {
       const db = await loadDb();
-      return sendJson(res, 200, db.labelBatches.map(batch => ({ ...batch, labels: undefined })));
+      return sendJson(res, 200, db.labelBatches.map(publicBatch));
     }
     const batchMatch = url.pathname.match(/^\/api\/label-batches\/([^/]+)$/);
     if (batchMatch && req.method === "GET") {
@@ -404,9 +417,16 @@ const server = http.createServer(async (req, res) => {
       if (new Set(sliceIds).size !== sliceIds.length) return sendJson(res, 400, { error: "duplicate_slice_in_batch" });
       return withLock(async () => {
         const db = await loadDb();
-        // 同一请求重复签发:只返回原批次
+        const fingerprint = requestFingerprint(input, sliceIds);
         const existing = db.labelBatches.find(item => item.idempotencyKey === idempotencyKey);
-        if (existing) return sendJson(res, 200, { idempotent: true, ...batchView(db, existing) });
+        if (existing) {
+          // 幂等键绑定请求内容:内容不一致即冲突,失败且不新增
+          if (existing.requestHash && existing.requestHash !== fingerprint) {
+            return sendJson(res, 409, { error: "idempotency_conflict", batchId: existing.id });
+          }
+          // 同一请求重复签发:只返回原批次
+          return sendJson(res, 200, { idempotent: true, batch: publicBatch(existing), labels: db.labels.filter(label => label.batchId === existing.id) });
+        }
         const template = db.labelTemplates.find(item => item.version === Number(input.templateVersion));
         if (!template) return sendJson(res, 400, { error: "template_not_found" });
         if (!taskSteps.includes(input.step)) return sendJson(res, 400, { error: "invalid_step" });
@@ -430,6 +450,7 @@ const server = http.createServer(async (req, res) => {
         const batch = {
           id: `LB-${String(db.labelBatches.length + 1).padStart(4, "0")}`,
           idempotencyKey,
+          requestHash: fingerprint,
           templateVersion: template.version,
           step: input.step,
           count: sliceIds.length,
@@ -440,7 +461,7 @@ const server = http.createServer(async (req, res) => {
         db.labels.push(...labels);
         db.labelSerial = Math.max(db.labelSerial, ...serials);
         await saveDb(db);
-        return sendJson(res, 201, { idempotent: false, ...batchView(db, batch) });
+        return sendJson(res, 201, { idempotent: false, batch: publicBatch(batch), labels });
       });
     }
 

@@ -1,4 +1,15 @@
-const BASE = process.env.BASE || "http://localhost:3025";
+// 验收脚本:独立端口 + 临时数据文件起私有实例,每次运行互不影响,不触碰正式数据
+import { spawn } from "node:child_process";
+import { rm, readFile, writeFile } from "node:fs/promises";
+import crypto from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const PORT = Number(process.env.TEST_PORT || 3125);
+const DB = process.env.TEST_DB || `/tmp/labels-accept-${process.pid}.json`;
+const BASE = `http://localhost:${PORT}`;
+
 let passed = 0, failed = 0;
 function check(name, cond, extra = "") {
   if (cond) { passed++; console.log(`  PASS ${name}`); }
@@ -12,44 +23,52 @@ async function api(path, options = {}) {
   return { status: res.status, data };
 }
 const post = (path, body) => api(path, { method: "POST", body: JSON.stringify(body) });
+const labelCount = async () => (await api("/api/labels")).data.length;
 
-// 准备:两个切片,SL-001-A 当前工序为 研磨,再建一个处于 切割 的切片
 async function setup() {
-  const samples = (await api("/api/samples")).data;
-  let s = samples.find(x => x.id === "CORE-001");
-  if (!s.slices.find(x => x.id === "SL-T1")) await post(`/api/samples/CORE-001/slices`, { id: "SL-T1", method: "测试" });
-  // 把 SL-T1 推进到 切割
-  await post(`/api/samples/CORE-001/slices/SL-T1/logs`, { step: "切割", note: "测试推进" });
-  return (await api("/api/samples")).data.find(x => x.id === "CORE-001");
+  // 种子数据:CORE-001 / SL-001-A(研磨);再建 SL-T1 并推进到 切割
+  await post("/api/samples/CORE-001/slices", { id: "SL-T1", method: "测试" });
+  await post("/api/samples/CORE-001/slices/SL-T1/logs", { step: "切割", note: "测试推进" });
 }
 
 const run = async () => {
-  const sample = await setup();
+  await setup();
+
   console.log("== 1. 批量签发(选模板版本+工序,唯一有序) ==");
   const key1 = "REQ-TEST-" + Date.now();
   const r1 = await post("/api/label-batches", { idempotencyKey: key1, templateVersion: 1, step: "研磨", sliceIds: ["SL-001-A", "SL-T1"] });
   check("签发 201", r1.status === 201, JSON.stringify(r1.data));
+  check("响应含批次 id 和数量(页面展示所需)", r1.data.batch && r1.data.batch.id && r1.data.batch.count === 2, JSON.stringify(r1.data.batch));
   check("生成 2 枚", r1.data.labels.length === 2);
   const serials = r1.data.labels.map(l => l.serial);
   check("序号有序递增", serials[1] === serials[0] + 1, serials.join(","));
   check("编码唯一", new Set(r1.data.labels.map(l => l.code)).size === 2);
-  const [L1, L2] = r1.data.labels; // L1=SL-001_A 研磨, L2=SL-T1 研磨
+  const [L1, L2] = r1.data.labels;
 
   console.log("== 2. 同一请求重复签发只返回原批次 ==");
   const r2 = await post("/api/label-batches", { idempotencyKey: key1, templateVersion: 1, step: "研磨", sliceIds: ["SL-001-A", "SL-T1"] });
   check("重复请求 200 且幂等", r2.status === 200 && r2.data.idempotent === true);
-  check("返回原批次", r2.data.id === r1.data.id);
-  const labelsAfterDup = (await api("/api/labels")).data.filter(l => l.batchId === r1.data.id);
-  check("未新增标签", labelsAfterDup.length === 2, String(labelsAfterDup.length));
+  check("返回原批次", r2.data.batch && r2.data.batch.id === r1.data.batch.id);
+  check("未新增标签", (await api("/api/labels")).data.filter(l => l.batchId === r1.data.batch.id).length === 2);
+
+  console.log("== 2b. 同幂等键不同内容 -> 冲突失败且不新增 ==");
+  const before2b = await labelCount();
+  const diffSlice = await post("/api/label-batches", { idempotencyKey: key1, templateVersion: 1, step: "研磨", sliceIds: ["SL-001-A"] });
+  check("换切片 409 idempotency_conflict", diffSlice.status === 409 && diffSlice.data.error === "idempotency_conflict", JSON.stringify(diffSlice.data));
+  const diffStep = await post("/api/label-batches", { idempotencyKey: key1, templateVersion: 1, step: "切割", sliceIds: ["SL-001-A", "SL-T1"] });
+  check("换工序 409", diffStep.status === 409 && diffStep.data.error === "idempotency_conflict");
+  const diffTpl = await post("/api/label-batches", { idempotencyKey: key1, templateVersion: 2, step: "研磨", sliceIds: ["SL-001-A", "SL-T1"] });
+  check("换模板 409", diffTpl.status === 409 && diffTpl.data.error === "idempotency_conflict");
+  check("冲突后标签数不变", (await labelCount()) === before2b);
+  check("冲突后批次数不变", (await api("/api/label-batches")).data.length === 1);
 
   console.log("== 3. 并发签发同幂等键 -> 只生效一次 ==");
   const keyC = "REQ-CONC-" + Date.now();
   const conc = await Promise.all([1, 2, 3, 4].map(() =>
     post("/api/label-batches", { idempotencyKey: keyC, templateVersion: 1, step: "切割", sliceIds: ["SL-T1"] })));
-  const batchIds = new Set(conc.map(r => r.data.id));
+  const batchIds = new Set(conc.map(r => r.data.batch && r.data.batch.id));
   check("并发签发只产生一个批次", batchIds.size === 1, [...batchIds].join(","));
-  const concLabels = (await api("/api/labels")).data.filter(l => l.batchId === [...batchIds][0]);
-  check("并发签发只产生一枚标签", concLabels.length === 1, String(concLabels.length));
+  check("并发签发只产生一枚标签", (await api("/api/labels")).data.filter(l => l.batchId === [...batchIds][0]).length === 1);
 
   console.log("== 4. 批量过大整批失败 ==");
   const tooMany = Array.from({ length: 51 }, (_, i) => `SL-X${i}`);
@@ -57,22 +76,18 @@ const run = async () => {
   check("过大返回 400 batch_too_large", rBig.status === 400 && rBig.data.error === "batch_too_large", JSON.stringify(rBig.data));
 
   console.log("== 5. 序号冲突整批失败(无部分写入) ==");
-  const before = (await api("/api/labels")).data.length;
+  const before = await labelCount();
   const rConflict = await post("/api/label-batches", { idempotencyKey: "REQ-CFL-" + Date.now(), templateVersion: 1, step: "研磨", sliceIds: ["SL-001-A", "SL-T1"], serials: [L1.serial, L1.serial] });
   check("冲突返回 409 serial_conflict", rConflict.status === 409 && rConflict.data.error === "serial_conflict", JSON.stringify(rConflict.data));
   const rConflict2 = await post("/api/label-batches", { idempotencyKey: "REQ-CFL2-" + Date.now(), templateVersion: 1, step: "研磨", sliceIds: ["SL-001-A", "SL-T1"], serials: [L1.serial, 999001] });
   check("与既有编码冲突也 409", rConflict2.status === 409 && rConflict2.data.error === "serial_conflict");
-  const after = (await api("/api/labels")).data.length;
-  check("失败后标签数不变(整批回滚)", before === after, `${before}->${after}`);
+  check("失败后标签数不变(整批回滚)", (await labelCount()) === before);
 
   console.log("== 6. 扫码核销:正常匹配切片+当前工序 ==");
   const okScan = await post("/api/scan", { code: L1.code, sig: L1.sig, sliceId: "SL-001-A", step: "研磨" });
   check("核销成功", okScan.status === 200 && okScan.data.result === "成功", JSON.stringify(okScan.data));
 
   console.log("== 7. 并发扫码同一标签 -> 只核销一次 ==");
-  const scans = await Promise.all([1, 2, 3, 4, 5].map(() =>
-    post("/api/scan", { code: L2.code, sig: L2.sig, sliceId: "SL-T1", step: "研磨" })));
-  // SL-T1 当前工序是 切割,标签工序是 研磨 -> 全部应跳步失败;改用新标签测并发
   const keyS = "REQ-SCAN-" + Date.now();
   const rScanBatch = await post("/api/label-batches", { idempotencyKey: keyS, templateVersion: 1, step: "切割", sliceIds: ["SL-T1"] });
   const LC = rScanBatch.data.labels[0];
@@ -81,8 +96,7 @@ const run = async () => {
   const okCount = concScans.filter(r => r.status === 200).length;
   check("并发扫码仅一次成功", okCount === 1, `成功${okCount}次`);
   check("其余为重复核销失败", concScans.filter(r => r.status === 409).length === 4);
-  const lcAfter = (await api("/api/labels")).data.find(l => l.code === LC.code);
-  check("标签状态为已核销", lcAfter.status === "已核销");
+  check("标签状态为已核销", (await api("/api/labels")).data.find(l => l.code === LC.code).status === "已核销");
 
   console.log("== 8. 跨片扫码失败且状态不变 ==");
   const keyX = "REQ-X-" + Date.now();
@@ -90,8 +104,7 @@ const run = async () => {
   const LX = rX.data.labels[0];
   const cross = await post("/api/scan", { code: LX.code, sig: LX.sig, sliceId: "SL-001-A", step: "切割" });
   check("跨片 409", cross.status === 409 && /跨片/.test(cross.data.reason), cross.data.reason);
-  const lxAfter = (await api("/api/labels")).data.find(l => l.code === LX.code);
-  check("跨片失败后标签仍有效", lxAfter.status === "有效");
+  check("跨片失败后标签仍有效", (await api("/api/labels")).data.find(l => l.code === LX.code).status === "有效");
 
   console.log("== 9. 跳步扫码失败 ==");
   const skip = await post("/api/scan", { code: L2.code, sig: L2.sig, sliceId: "SL-T1", step: "研磨" });
@@ -129,13 +142,32 @@ const run = async () => {
   const voidScan = await post("/api/scan", { code: LV.code, sig: LV.sig, sliceId: "SL-T1", step: "切割" });
   check("作废标签扫码 409", voidScan.status === 409 && /已作废/.test(voidScan.data.reason));
 
+  console.log("== 13b. 过期标签扫码自动作废 ==");
+  const keyE = "REQ-E-" + Date.now();
+  const rE = await post("/api/label-batches", { idempotencyKey: keyE, templateVersion: 1, step: "切割", sliceIds: ["SL-T1"] });
+  const LE = rE.data.labels[0];
+  // 在隔离数据文件上把过期时间改到过去并重签名(模拟时间流逝)
+  const db = JSON.parse(await readFile(DB, "utf8"));
+  const target = db.labels.find(l => l.code === LE.code);
+  target.expiresAt = new Date(Date.now() - 86400000).toISOString();
+  target.sig = crypto.createHmac("sha256", db.labelSecret)
+    .update([target.code, target.sliceId, target.step, target.templateVersion, target.expiresAt].join("|"))
+    .digest("hex").slice(0, 24);
+  await writeFile(DB, JSON.stringify(db, null, 2));
+  const expScan = await post("/api/scan", { code: LE.code, sig: target.sig, sliceId: "SL-T1", step: "切割" });
+  check("过期扫码 409 并提示过期", expScan.status === 409 && /过期/.test(expScan.data.reason), expScan.data.reason);
+  const leAfter = (await api("/api/labels")).data.find(l => l.code === LE.code);
+  check("过期自动作废且原因正确", leAfter.status === "已作废" && leAfter.voidReason === "过期");
+
   console.log("== 14. 模板升版只影响新标签,旧批次可查 ==");
+  const tplsBefore = (await api("/api/label-templates")).data;
+  const expectVersion = Math.max(...tplsBefore.map(t => t.version)) + 1;
   const tpl = await post("/api/label-templates", { name: "荧光薄片标签", prefix: "FLU", ttlDays: 60 });
-  check("升版为 v2", tpl.status === 201 && tpl.data.version === 2, JSON.stringify(tpl.data));
+  check(`升版为 v${expectVersion}`, tpl.status === 201 && tpl.data.version === expectVersion, JSON.stringify(tpl.data));
   const keyN = "REQ-NEW-" + Date.now();
-  const rNew = await post("/api/label-batches", { idempotencyKey: keyN, templateVersion: 2, step: "切割", sliceIds: ["SL-T1"] });
-  check("新批次用 v2 模板与前缀", rNew.status === 201 && rNew.data.labels[0].code.startsWith("FLU-") && rNew.data.labels[0].templateVersion === 2, JSON.stringify(rNew.data.labels?.[0]));
-  const oldBatch = await api(`/api/label-batches/${r1.data.id}`);
+  const rNew = await post("/api/label-batches", { idempotencyKey: keyN, templateVersion: tpl.data.version, step: "切割", sliceIds: ["SL-T1"] });
+  check("新批次用新模板与前缀", rNew.status === 201 && rNew.data.labels[0].code.startsWith("FLU-") && rNew.data.labels[0].templateVersion === tpl.data.version, JSON.stringify(rNew.data.labels?.[0]));
+  const oldBatch = await api(`/api/label-batches/${r1.data.batch.id}`);
   check("旧批次仍可查", oldBatch.status === 200 && oldBatch.data.templateVersion === 1);
   const oldLabel = (await api("/api/labels")).data.find(l => l.code === L1.code);
   check("旧标签数据未受升版影响", oldLabel && oldLabel.templateVersion === 1 && oldLabel.code.startsWith("LBL-"));
@@ -145,6 +177,23 @@ const run = async () => {
   check("扫码记录包含成功与失败", logs.some(l => l.result === "成功") && logs.some(l => l.result === "失败"), `共${logs.length}条`);
 
   console.log(`\n结果: ${passed} 通过, ${failed} 失败`);
-  process.exit(failed ? 1 : 0);
+  if (failed) process.exitCode = 1;
 };
-run().catch(e => { console.error(e); process.exit(1); });
+
+// ---- 启动隔离实例,跑完清理 ----
+await rm(DB, { force: true });
+const child = spawn(process.execPath, [join(__dirname, "server.js")], {
+  env: { ...process.env, PORT: String(PORT), DB_PATH: DB },
+  stdio: "ignore"
+});
+try {
+  let ready = false;
+  for (let i = 0; i < 60 && !ready; i++) {
+    try { const r = await fetch(BASE + "/api/samples"); ready = r.ok; } catch { await new Promise(r => setTimeout(r, 200)); }
+  }
+  if (!ready) throw new Error("隔离实例启动失败");
+  await run();
+} finally {
+  child.kill();
+  await rm(DB, { force: true });
+}
